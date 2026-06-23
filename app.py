@@ -5,8 +5,6 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import FAISS
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_groq import ChatGroq
-from langchain.chains import ConversationalRetrievalChain
-from langchain.memory import ConversationBufferMemory
 from langchain.schema import Document
 import os
 
@@ -14,13 +12,6 @@ st.set_page_config(page_title="DocMind - PDF Chatbot", page_icon="📄", layout=
 
 st.markdown("""
 <style>
-.main-header {
-    font-size: 2.5rem;
-    font-weight: 700;
-    color: #6c8cff;
-    text-align: center;
-    padding: 1rem 0;
-}
 .source-box {
     background: #1e2535;
     border: 1px solid #2a3044;
@@ -28,12 +19,13 @@ st.markdown("""
     padding: 12px;
     margin: 6px 0;
     font-size: 0.85rem;
+    color: white;
 }
 </style>
 """, unsafe_allow_html=True)
 
-st.markdown('<h1 class="main-header">◈ DocMind — PDF Chatbot</h1>', unsafe_allow_html=True)
-st.markdown("<p style='text-align:center; color:#8891aa'>Upload PDFs and ask questions — with source attribution</p>", unsafe_allow_html=True)
+st.markdown("<h1 style='text-align:center; color:#6c8cff;'>◈ DocMind — PDF Chatbot</h1>", unsafe_allow_html=True)
+st.markdown("<p style='text-align:center; color:#8891aa;'>Upload PDFs and ask questions — with source attribution</p>", unsafe_allow_html=True)
 
 with st.sidebar:
     st.header("📁 Upload PDFs")
@@ -45,6 +37,7 @@ with st.sidebar:
         with st.spinner("Processing PDFs..."):
             docs = []
             splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=100)
+
             for pdf_file in uploaded_files:
                 reader = PdfReader(pdf_file)
                 for page_num, page in enumerate(reader.pages, start=1):
@@ -62,26 +55,17 @@ with st.sidebar:
             else:
                 embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
                 vectorstore = FAISS.from_documents(docs, embeddings)
-                memory = ConversationBufferMemory(
-                    memory_key="chat_history",
-                    return_messages=True,
-                    output_key="answer"
-                )
-                llm = ChatGroq(api_key=groq_api_key, model_name="llama-3.3-70b-versatile", temperature=0)
-                chain = ConversationalRetrievalChain.from_llm(
-                    llm=llm,
-                    retriever=vectorstore.as_retriever(search_kwargs={"k": 5}),
-                    memory=memory,
-                    return_source_documents=True,
-                    output_key="answer"
-                )
-                st.session_state.chain = chain
+                st.session_state.vectorstore = vectorstore
+                st.session_state.groq_api_key = groq_api_key
                 st.session_state.messages = []
                 st.success(f"✅ {len(docs)} chunks indexed from {len(uploaded_files)} PDF(s)!")
 
-if "chain" not in st.session_state:
+if "vectorstore" not in st.session_state:
     st.info("👈 Upload PDFs and enter your Groq API key in the sidebar to begin.")
 else:
+    if "messages" not in st.session_state:
+        st.session_state.messages = []
+
     for msg in st.session_state.messages:
         with st.chat_message(msg["role"]):
             st.markdown(msg["content"])
@@ -100,10 +84,42 @@ else:
 
         with st.chat_message("assistant"):
             with st.spinner("Thinking..."):
-                result = st.session_state.chain({"question": question})
-                answer = result["answer"]
-                source_docs = result.get("source_documents", [])
+                # Retrieve relevant chunks
+                retriever = st.session_state.vectorstore.as_retriever(search_kwargs={"k": 5})
+                source_docs = retriever.invoke(question)
 
+                # Build context
+                context = "\n\n".join([doc.page_content for doc in source_docs])
+
+                # Build prompt
+                chat_history = ""
+                for msg in st.session_state.messages[-6:]:
+                    chat_history += f"{msg['role'].upper()}: {msg['content']}\n"
+
+                prompt = f"""You are a helpful assistant. Answer the question based ONLY on the provided context.
+Always mention which page and file the answer comes from.
+If the answer is not in the context, say "I couldn't find this in the uploaded documents."
+
+Context:
+{context}
+
+Chat History:
+{chat_history}
+
+Question: {question}
+
+Answer:"""
+
+                llm = ChatGroq(
+                    api_key=st.session_state.groq_api_key,
+                    model_name="llama-3.3-70b-versatile",
+                    temperature=0
+                )
+
+                response = llm.invoke(prompt)
+                answer = response.content
+
+                # Extract sources
                 sources = []
                 seen = set()
                 for doc in source_docs:
@@ -115,17 +131,18 @@ else:
                             "page": doc.metadata["page"],
                             "excerpt": doc.page_content[:250] + "..."
                         })
-st.markdown(answer)
 
-if sources:
-    with st.expander(f"📄 Sources ({len(sources)} found)"):
-        for src in sources:
-            st.markdown(
-                f"""
-                <div class="source-box">
-                    <b>📄 {src['filename']} — Page {src['page']}</b><br>
-                    <i>{src['excerpt']}</i>
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
+                st.markdown(answer)
+                if sources:
+                    with st.expander(f"📄 Sources ({len(sources)} found)"):
+                        for src in sources:
+                            st.markdown(f"""<div class="source-box">
+                                <b>📄 {src['filename']} — Page {src['page']}</b><br>
+                                <i>{src['excerpt']}</i>
+                            </div>""", unsafe_allow_html=True)
+
+        st.session_state.messages.append({
+            "role": "assistant",
+            "content": answer,
+            "sources": sources
+        })
